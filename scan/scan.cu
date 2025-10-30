@@ -175,6 +175,32 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+// In:  1, 1, 2, 3, 4, 4, 5, ...
+// Out: 1, 0, 0, 0, 1, 0, 0, ...
+__global__ void repeat_mask_kernel(int* input, int N, int* output) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N - 1) {
+        if ( i == N - 1) {
+            output[N - 1] = 0;  // Question: does CUDA init to 0? If so we can just return.
+        }
+        return;                 // (N - 1)th (last) element doesn't have a next-neighbor
+    }
+
+    if (input[i] == input[i + 1]) {
+        output[i] = 1;
+    } else {
+        output[i] = 0;
+    }
+}
+
+__global__ void collect_repeats_kernel(int* input, int* cdf, int N, int* output) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 1 || i >= N) return;
+
+    if (cdf[i - 1] != cdf[i]) {
+        output[cdf[i - 1]] = i - 1;
+    }
+}
 
 // find_repeats --
 //
@@ -196,7 +222,29 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    int rounded_length = nextPow2(length);
+    int* mask;
+
+    cudaMalloc((void **)&mask, rounded_length * sizeof(int));
+    cudaDeviceSynchronize();
+
+    int num_blocks = rounded_length / THREADS_PER_BLOCK + 1;
+    repeat_mask_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(device_input, rounded_length, mask);
+    cudaDeviceSynchronize();
+
+    exclusive_scan(mask, rounded_length, mask); // NOTE: The first input is ignored, as the exclusive scan operates in-place over result.
+    cudaDeviceSynchronize();
+
+    int num_collection_blocks = length / THREADS_PER_BLOCK + 1;
+    collect_repeats_kernel<<<num_collection_blocks, THREADS_PER_BLOCK>>>(device_input, mask, length, device_output);
+    cudaDeviceSynchronize();
+
+    int count;
+    cudaMemcpy(&count, mask + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
+    cudaFree(mask);
+    return count; 
 }
 
 
