@@ -14,12 +14,19 @@
 
 #define THREADS_PER_BLOCK 256
 
-__global__ void upsweep_kernel(int* output, int two_d, int two_dplus1) {
-    int index = blockIDx.x * blockDim.x + threadId.x;
-    output[index + two_dplus1 - 1] += output[index + two_dplus1 - 1];
+__global__ void upsweep_kernel(int* output, int two_d, int two_dplus1, int total_ops) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( index >= total_ops ) return;   // Handle rounding errors if block size doesn't align with work.
+
+    int i = index * two_dplus1;
+    output[i+two_dplus1-1] += output[i+two_d-1];
 }
 
-__global__ void downsweep_kernel(int* input, int*output, int two_d, int two_dplus1) {
+__global__ void downsweep_kernel(int*output, int two_d, int two_dplus1, int total_ops) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if ( index >= total_ops ) return;
+
+    int i = index * two_dplus1;
     int t = output[i+two_d-1];
     output[i+two_d-1] = output[i+two_dplus1-1];
     output[i+two_dplus1-1] += t;
@@ -58,22 +65,30 @@ void exclusive_scan(int* input, int N, int* result)
     //       input is ignored and result is assumed to store the contents
     //       of input.
 
-    // upsweep
-    for (int two_d = 1; two_d <= N/2; two_d *= 2) {
-        int two_dplus1 = 2*two_d;
-        int ops_count = N / two_dplus1;
+    int rounded_N = nextPow2(N);
 
-        upsweep_kernel<<<ops_count/THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(result, result, two_d, two_dplus1);
+    // upsweep
+    for (int two_d = 1; two_d <= rounded_N/2; two_d *= 2) {
+        int two_dplus1 = 2*two_d;
+        int ops_count = rounded_N / two_dplus1;
+        int num_blocks = (ops_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+        upsweep_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(result, two_d, two_dplus1, ops_count);
     }
 
-    result[N - 1] = 0;
+    // NOTE: we're relying on the fact that we're only using the default stream for these computations,
+    //       so every iteration of the loop above is serialized relative to each other.
+    //       With this, we don't need an explicit cudaDeviceSynchronize() between calls.
+
+    cudaMemset(result + rounded_N - 1, 0, sizeof(int));
 
     // downsweep
-    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+    for (int two_d = rounded_N/2; two_d >= 1; two_d /= 2) {
         int two_dplus1 = 2*two_d;
-        int ops_count = N / two_dplus1;
-
-        downsweep_kernel<<<ops_count/THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(result, result, two_d, two_dplus1);
+        int ops_count = rounded_N / two_dplus1;
+        int num_blocks = (ops_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        
+        downsweep_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(result, two_d, two_dplus1, ops_count);
     }
 }
 
