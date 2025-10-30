@@ -14,6 +14,16 @@
 
 #define THREADS_PER_BLOCK 256
 
+__global__ void upsweep_kernel(int* output, int two_d, int two_dplus1) {
+    int index = blockIDx.x * blockDim.x + threadId.x;
+    output[index + two_dplus1 - 1] += output[index + two_dplus1 - 1];
+}
+
+__global__ void downsweep_kernel(int* input, int*output, int two_d, int two_dplus1) {
+    int t = output[i+two_d-1];
+    output[i+two_d-1] = output[i+two_dplus1-1];
+    output[i+two_dplus1-1] += t;
+}
 
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
@@ -44,17 +54,27 @@ static inline int nextPow2(int n) {
 // places it in result
 void exclusive_scan(int* input, int N, int* result)
 {
+    // NOTE: For efficiency, we're going with an in-place scan, so
+    //       input is ignored and result is assumed to store the contents
+    //       of input.
 
-    // CS149 TODO:
-    //
-    // Implement your exclusive scan implementation here.  Keep in
-    // mind that although the arguments to this function are device
-    // allocated arrays, this is a function that is running in a thread
-    // on the CPU.  Your implementation will need to make multiple calls
-    // to CUDA kernel functions (that you must write) to implement the
-    // scan.
+    // upsweep
+    for (int two_d = 1; two_d <= N/2; two_d *= 2) {
+        int two_dplus1 = 2*two_d;
+        int ops_count = N / two_dplus1;
 
+        upsweep_kernel<<<ops_count/THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(result, result, two_d, two_dplus1);
+    }
 
+    result[N - 1] = 0;
+
+    // downsweep
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d;
+        int ops_count = N / two_dplus1;
+
+        downsweep_kernel<<<ops_count/THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(result, result, two_d, two_dplus1);
+    }
 }
 
 
