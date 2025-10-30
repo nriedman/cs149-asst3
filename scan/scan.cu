@@ -14,6 +14,18 @@
 
 #define THREADS_PER_BLOCK 256
 
+// helper function to round an integer up to the next power of 2
+static inline int nextPow2(int n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
 __global__ void upsweep_kernel(int* output, int two_d, int two_dplus1, int total_ops) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if ( index >= total_ops ) return;   // Handle rounding errors if block size doesn't align with work.
@@ -30,18 +42,6 @@ __global__ void downsweep_kernel(int*output, int two_d, int two_dplus1, int tota
     int t = output[i+two_d-1];
     output[i+two_d-1] = output[i+two_dplus1-1];
     output[i+two_dplus1-1] += t;
-}
-
-// helper function to round an integer up to the next power of 2
-static inline int nextPow2(int n) {
-    n--;
-    n |= n >> 1;
-    n |= n >> 2;
-    n |= n >> 4;
-    n |= n >> 8;
-    n |= n >> 16;
-    n++;
-    return n;
 }
 
 // exclusive_scan --
