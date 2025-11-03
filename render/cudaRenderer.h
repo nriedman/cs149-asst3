@@ -20,7 +20,12 @@ class CudaRenderer : public CircleRenderer {
   float* cudaDeviceRadius;
   float* cudaDeviceImageData;
 
- public:
+  // Binning cache state
+  bool binsDirty = true;
+  int lastTilesX = -1;
+  int lastTilesY = -1;
+  int lastNumCircles = -1;
+  SceneName lastSceneName = (SceneName)(-1); public:
   CudaRenderer();
   virtual ~CudaRenderer();
 
