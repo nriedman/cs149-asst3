@@ -474,8 +474,6 @@ __global__ void kernelRenderCircles() {
     *imagePtr = pixelColor;
 }
 
-
-
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -705,13 +703,23 @@ CudaRenderer::render() {
     static size_t allocatedIndices = 0;
 
     if (numTiles != allocatedTilesAlloc) {
-        if (d_tileCounts) { cudaFree(d_tileCounts); cudaFree(d_tileOffsets); if (d_tileIndices) cudaFree(d_tileIndices); d_tileIndices = nullptr; allocatedIndices = 0; }
+        if (d_tileCounts) { 
+            cudaFree(d_tileCounts);
+            cudaFree(d_tileOffsets);
+            
+            if (d_tileIndices)
+                cudaFree(d_tileIndices);
+            
+            d_tileIndices = nullptr;
+            allocatedIndices = 0;
+        }
+        
         cudaMalloc(&d_tileCounts, sizeof(int) * numTiles);
         cudaMalloc(&d_tileOffsets, sizeof(int) * numTiles);
         allocatedTilesAlloc = numTiles;
     }
 
-    // Only (re)build bins when necessary: after animation or changes
+    // Only build bins when necessary: after animation or changes
     static bool binsBuilt = false;
     if (binsDirty || !binsBuilt || lastTilesX != tilesX || lastTilesY != tilesY || lastNumCircles != numCircles || lastSceneName != sceneName) {
         size_t total = 0;
@@ -719,14 +727,15 @@ CudaRenderer::render() {
         cudaMemcpy(position, cudaDevicePosition, sizeof(float) * 3 * numCircles, cudaMemcpyDeviceToHost);
         cudaMemcpy(radius,   cudaDeviceRadius,   sizeof(float) * numCircles,     cudaMemcpyDeviceToHost);
 
-    std::vector<int> h_counts(numTiles, 0);
-    std::vector<int> h_offsets(numTiles, 0);
+        std::vector<int> h_counts(numTiles, 0);
+        std::vector<int> h_offsets(numTiles, 0);
         for (int circleIndex = 0; circleIndex < numCircles; ++circleIndex) {
             int index3 = 3 * circleIndex;
             float3 p = *(float3*)&position[index3];
             float rad = radius[circleIndex];
             int minX, maxX, minY, maxY;
             circleScreenBBox(image->width, image->height, p, rad, &minX, &maxX, &minY, &maxY);
+            
             int tileMinX = minX / TILE_SIZE;
             int tileMaxX = (maxX + TILE_SIZE - 1) / TILE_SIZE;
             int tileMinY = minY / TILE_SIZE;
@@ -735,6 +744,7 @@ CudaRenderer::render() {
             tileMaxX = std::max(0, std::min(tileMaxX, tilesX));
             tileMinY = std::max(0, std::min(tileMinY, tilesY));
             tileMaxY = std::max(0, std::min(tileMaxY, tilesY));
+            
             for (int ty = tileMinY; ty < tileMaxY; ++ty) {
                 int rowBase = ty * tilesX;
                 for (int tx = tileMinX; tx < tileMaxX; ++tx) {
@@ -742,8 +752,22 @@ CudaRenderer::render() {
                 }
             }
         }
-        total = 0; for (int i = 0; i < numTiles; ++i) { int c = h_counts[i]; h_offsets[i] = total; total += c; }
-        if (total > allocatedIndices) { if (d_tileIndices) cudaFree(d_tileIndices); cudaMalloc(&d_tileIndices, sizeof(int) * total); allocatedIndices = total; }
+
+        total = 0;
+        for (int i = 0; i < numTiles; ++i) {
+            int c = h_counts[i];
+            h_offsets[i] = total;
+            total += c;
+        }
+        
+        if (total > allocatedIndices) {
+            if (d_tileIndices)
+                cudaFree(d_tileIndices);
+            
+            cudaMalloc(&d_tileIndices, sizeof(int) * total);
+            allocatedIndices = total;
+        }
+        
         std::vector<int> h_indices(total); std::vector<int> h_write = h_offsets;
         for (int circleIndex = 0; circleIndex < numCircles; ++circleIndex) {
             int index3 = 3 * circleIndex;
