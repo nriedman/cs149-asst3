@@ -22,8 +22,8 @@
 
 // MARK: Constants
 
-#define CELL_WIDTH 64
-#define CELL_HEIGHT 64
+#define CELL_WIDTH 32
+#define CELL_HEIGHT 32
 
 #define BATCH_SIZE 1024
 #define SCAN_BLOCK_DIM BATCH_SIZE
