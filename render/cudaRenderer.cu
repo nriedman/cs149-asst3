@@ -14,9 +14,20 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#include "circleBoxTest.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
+
+// MARK: Constants
+
+#define CELL_WIDTH 64
+#define CELL_HEIGHT 64
+
+#define BATCH_SIZE 1024
+#define SCAN_BLOCK_DIM BATCH_SIZE
+#include "exclusiveScan.cu_inl"
 
 struct GlobalConstants {
 
@@ -31,6 +42,11 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+
+    uint16_t* cellAssigments;
+
+    int numHorizontalCells;
+    int numVerticalCells;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -344,7 +360,7 @@ struct SimplePixelShader {
 // function.  Called by kernelRenderCircles()
 template <typename PixelShaderFn>
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, PixelShaderFn pixelShaderFn) {
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* accPtr, PixelShaderFn pixelShaderFn) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
@@ -366,7 +382,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, Pixe
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
-    float4 existingColor = *imagePtr;
+    float4 existingColor = *accPtr;
     float4 newColor;
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
@@ -374,7 +390,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, Pixe
     newColor.w = alpha + existingColor.w;
 
     // global memory write
-    *imagePtr = newColor;
+    *accPtr = newColor;
 
     // END SHOULD-BE-ATOMIC REGION
 }
@@ -435,6 +451,127 @@ __global__ void kernelRenderCircles() {
                 shadePixel(index, pixelCenterNorm, p, imgPtr, SimplePixelShader{});
                 imgPtr++;
             }
+        }
+    }
+}
+
+// MARK: Pixel Shading
+
+__global__ void shadePixelsFromAssignment() {
+
+    // First, copy the assignments of this block to shared memory to save on global reads.
+    __shared__ short num_assigned;
+    __shared__ int block_id;
+
+    int index = threadIdx.y * blockDim.x + threadIdx.x;
+    if (index == 0) {
+        block_id = blockIdx.y * gridDim.x + blockIdx.x;
+        num_assigned = cuConstRendererParams.cellAssigments[block_id * (BATCH_SIZE + 1)];
+    }
+
+    __syncthreads();
+
+    // If there were no circles in this block, exit early.
+    if (num_assigned == 0)
+        return;
+
+    __shared__ short assigned[BATCH_SIZE];
+
+    if (index < num_assigned)
+        assigned[index] = cuConstRendererParams.cellAssigments[block_id * (BATCH_SIZE + 1) + index + 1];
+
+    __syncthreads();
+
+    // Now, each pixel can update its shade inependently.
+
+    int global_x = blockIdx.x * CELL_WIDTH + threadIdx.x;
+    int global_y = blockIdx.y * CELL_HEIGHT + threadIdx.y;
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    if (global_x >= imageWidth || global_y >= imageHeight)
+        return;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    float4* pxlPtr = (float4*)(&cuConstRendererParams.imageData[4 * (global_y * imageWidth + global_x)]);
+    float4 acc = *pxlPtr;
+
+    float2 pixelCenterNorm = make_float2(
+        invWidth * (static_cast<float>(global_x) + 0.5f),
+        invHeight * (static_cast<float>(global_y) + 0.5f)
+    );
+
+    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        for (int assign_idx = 0; assign_idx < num_assigned; assign_idx++) {
+            int circle_idx = assigned[assign_idx];
+            float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
+            shadePixel(assign_idx, pixelCenterNorm, p, &acc, SnowflakePixelShader{});
+        }
+    } else {
+        for (int assign_idx = 0; assign_idx < num_assigned; assign_idx++) {
+            int circle_idx = assigned[assign_idx];
+            float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
+            shadePixel(assign_idx, pixelCenterNorm, p, &acc, SimplePixelShader{});
+        }
+    }
+
+    // Write the local accumulator to the image.
+    *pxlPtr = acc;
+}
+
+// MARK: Cell Assignments Kernel
+
+// assignCirclesToGridCells -- (CUDA device code)
+//
+// Each thread computes the indices of the circles that intersect
+// with a cell in the partitioning grid.
+__global__ void assignCirclesToGridCells(int batchId) {
+    // Identify thread
+    int block_id = blockIdx.y * gridDim.x + blockIdx.x;
+    int thread_id = threadIdx.x;
+    int circle_idx = BATCH_SIZE * batchId + thread_id;
+
+    if (circle_idx >= cuConstRendererParams.numCircles)
+        return;
+
+    // Check if the thread's circle intersects with this cell
+    float boxL = CELL_WIDTH * blockIdx.x;
+    float boxR = CELL_WIDTH * blockIdx.x + (CELL_WIDTH - 1);
+    float boxB = CELL_HEIGHT * blockIdx.y;
+    float boxT = CELL_HEIGHT * blockIdx.y + (CELL_HEIGHT - 1);
+
+    float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
+    float r = cuConstRendererParams.radius[circle_idx];
+
+    bool circle_intersects = circleInBox(
+        p.x, p.y, r,
+        boxL, boxR, boxT, boxB
+    );
+
+    // Write the flag to shared mask
+    __shared__ uint prefixSumInput[BATCH_SIZE];
+    prefixSumInput[thread_id] = circle_intersects; 
+
+    // Sync up
+    __syncthreads();
+
+    // Perform shared exclusive scan
+    __shared__ uint cdf[BATCH_SIZE];
+    __shared__ uint prefixSumScratch[2 * BATCH_SIZE];
+    sharedMemExclusiveScan(thread_id, prefixSumInput, cdf, prefixSumScratch, BATCH_SIZE);
+
+    // Write the results to global memory
+    uint16_t* assign_buf = cuConstRendererParams.cellAssigments + block_id * (BATCH_SIZE + 1);
+    if (thread_id >= 1 && thread_id < BATCH_SIZE) {
+        if (cdf[thread_id - 1] != cdf[thread_id]) {
+            assign_buf[cdf[thread_id - 1] + 1] = BATCH_SIZE * batchId + thread_id - 1;
+        } 
+
+        if (thread_id == BATCH_SIZE - 1) {
+            assign_buf[0] = cdf[thread_id] + 1;
         }
     }
 }
@@ -502,6 +639,8 @@ CudaRenderer::loadScene(SceneName scene, int seed) {
     loadCircleScene(sceneName, numCircles, position, velocity, color, radius, seed);
 }
 
+// MARK: Setup
+
 void
 CudaRenderer::setup() {
 
@@ -538,6 +677,11 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
 
+    // Allocate cell grid
+    int numHorizontalCells = (image->width + CELL_WIDTH - 1) / CELL_WIDTH;
+    int numVerticalCells = (image->height + CELL_HEIGHT - 1) / CELL_HEIGHT;
+    cudaMalloc(&cudaDeviceCellAssignments, sizeof(uint16_t) * numHorizontalCells * numVerticalCells * (BATCH_SIZE + 1));
+
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
@@ -561,6 +705,11 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
+
+    params.cellAssigments = cudaDeviceCellAssignments;
+
+    params.numHorizontalCells = numHorizontalCells;
+    params.numVerticalCells = numVerticalCells;
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -645,13 +794,29 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+// MARK: Render
+
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    int numHorizontalCells = (image->width + CELL_WIDTH - 1) / CELL_WIDTH;
+    int numVerticalCells = (image->height + CELL_HEIGHT - 1) / CELL_HEIGHT;
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    // Each cell gets a block of threads.
+    dim3 cellGridDim(numHorizontalCells, numVerticalCells);
+
+    // For shading, each pixel gets its own thread.
+    //
+    // The i'th pixel thread in block b has global coordinates:
+    // x: (b % numHorizontalCells) * CELL_WIDTH + (i % CELL_WIDTH)
+    // y: (b / numVerticalCells) * CELL_HEIGHT + (i / CELL_HEIGHT)
+    dim3 pixelBlockDim(CELL_WIDTH, CELL_HEIGHT);
+
+    int numBatches = numCircles / BATCH_SIZE;
+    for (int i = 0; i < numBatches; i++) {
+        assignCirclesToGridCells<<<cellGridDim, BATCH_SIZE>>>(i);
+        cudaDeviceSynchronize();
+        shadePixelsFromAssignment<<<cellGridDim, pixelBlockDim>>>();
+        cudaDeviceSynchronize();
+    }
 }
