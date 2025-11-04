@@ -775,6 +775,7 @@ CudaRenderer::render() {
             float rad = radius[circleIndex];
             int minX, maxX, minY, maxY;
             circleScreenBBox(image->width, image->height, p, rad, &minX, &maxX, &minY, &maxY);
+            
             int tileMinX = minX / TILE_SIZE;
             int tileMaxX = (maxX + TILE_SIZE - 1) / TILE_SIZE;
             int tileMinY = minY / TILE_SIZE;
@@ -783,6 +784,7 @@ CudaRenderer::render() {
             tileMaxX = std::max(0, std::min(tileMaxX, tilesX));
             tileMinY = std::max(0, std::min(tileMinY, tilesY));
             tileMaxY = std::max(0, std::min(tileMaxY, tilesY));
+            
             for (int ty = tileMinY; ty < tileMaxY; ++ty) {
                 int rowBase = ty * tilesX;
                 for (int tx = tileMinX; tx < tileMaxX; ++tx) {
