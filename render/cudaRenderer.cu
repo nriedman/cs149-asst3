@@ -768,7 +768,8 @@ CudaRenderer::render() {
             allocatedIndices = total;
         }
         
-        std::vector<int> h_indices(total); std::vector<int> h_write = h_offsets;
+        std::vector<int> h_indices(total);
+        std::vector<int> h_write = h_offsets;
         for (int circleIndex = 0; circleIndex < numCircles; ++circleIndex) {
             int index3 = 3 * circleIndex;
             float3 p = *(float3*)&position[index3];
